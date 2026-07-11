@@ -4,6 +4,8 @@
 [![PyPI](https://img.shields.io/pypi/v/paper-verifier)](https://pypi.org/project/paper-verifier/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
+**English** | [한국어](README.ko.md)
+
 **Deterministic manuscript audit**: cross-check every statistical claim in
 your manuscript against your *own* analysis outputs, and audit citation
 integrity end-to-end — before a reviewer (or a reader) does.
