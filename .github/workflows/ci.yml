@@ -1,0 +1,69 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.11", "3.12", "3.13", "3.14"]
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - run: pip install -e ".[dev]"
+      - run: pytest -q
+
+  integration:
+    # Keeps the README honest: the quickstart must run clean (exit 0, 0 FAIL),
+    # and an injected error must be caught (exit 1).
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -e .
+      - name: Quickstart runs clean
+        working-directory: examples/quickstart
+        run: |
+          paper-verify --config paper-verifier.toml --phase 1 --output-summary
+          python - <<'EOF'
+          import glob, json, sys
+          path = glob.glob("reports/*/verifications.jsonl")[0]
+          recs = [json.loads(l) for l in open(path, encoding="utf-8")]
+          fails = [r for r in recs if r["status"] == "FAIL"]
+          print(f"{len(recs)} verification targets, {len(fails)} FAIL")
+          sys.exit(1 if fails else 0)
+          EOF
+      - name: Injected error is caught (exit 1)
+        working-directory: examples/quickstart
+        run: |
+          sed -i 's/(Novak, 2024)/(Nowak, 2024)/' manuscript.md
+          if paper-verify --config paper-verifier.toml --phase 1; then
+            echo "expected exit 1 on a dangling citation" && exit 1
+          else
+            echo "dangling citation correctly failed the run"
+          fi
+      - name: PDF extra import smoke
+        run: |
+          pip install -e ".[pdf]"
+          python -c "import pdfplumber; print('pdfplumber import OK')"
+
+  package:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install build twine
+      - run: python -m build
+      - run: twine check dist/*

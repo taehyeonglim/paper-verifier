@@ -1,0 +1,50 @@
+# paper-verifier configuration for the quickstart demo.
+# This file doubles as a live reference for docs/configuration.md.
+
+[project]
+name = "quickstart-demo"
+manuscripts = ["manuscript.md"]        # literal paths or globs, relative to this file
+references = "references.md"
+stats = "statistics_verification.md"   # primary ground truth (cross-validated tables)
+summary_stats = "analysis_summary.md"  # supplementary M/SD ground truth
+reports_dir = "reports"                # a <sha8> run directory is created inside
+
+# [library]
+# root = "papers"                      # local PDF/fulltext library for attachment;
+                                       # unset → every reference reports WARN (not found)
+
+[stats]
+condition_labels = ["AI", "TEXT"]      # exactly two, in summary-table column order
+percent_dvs = ["quiz"]                 # DVs measured on a percent scale
+
+[stats.dv_keywords]                    # manuscript-prose keywords → DV
+engagement = ["engagement"]
+quiz = ["quiz accuracy", "quiz score", "quiz"]
+
+[stats.dv_aliases]                     # ground-truth-table row labels → DV
+"Engagement" = "engagement"
+"Quiz Score" = "quiz"
+# Aliases are how non-English analysis outputs work too, e.g.:
+# "참여도" = "engagement"
+
+[stats.alpha]                          # reliability ground truth per DV
+engagement = 0.81
+
+[stats.n]                              # sample sizes per context
+analytic = 30
+collected = 32
+excluded = 2
+
+[stats.summary_sections]               # analysis-summary headings → DV (M/SD tables)
+"3.1 Engagement" = "engagement"
+"3.2 Quiz Score" = "quiz"
+
+# [stats.headings]                     # override ground-truth table headings if your
+# p_table = "1. p값 검증"               # stats pipeline emits non-default (or non-English)
+                                       # section titles
+
+[llm]
+provider = "none"                      # Phase 1 quickstart is fully deterministic.
+# provider = "codex"                   # For Phase 2 (--phase 2): any local LLM CLI.
+# argv = ["codex", "exec", "--sandbox", "read-only", "--skip-git-repo-check", "-"]
+# timeout = 120

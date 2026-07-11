@@ -1,0 +1,53 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "paper-verifier"
+dynamic = ["version"]
+description = "Deterministic manuscript audit: cross-check statistical claims against your own analysis outputs, and audit citations end-to-end"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Taehyeong Lim" }]
+keywords = [
+  "reproducibility",
+  "manuscript",
+  "statistics",
+  "citation-audit",
+  "research-integrity",
+  "statcheck",
+]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Intended Audience :: Science/Research",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
+  "Topic :: Scientific/Engineering",
+  "Topic :: Text Processing :: Markup :: Markdown",
+]
+dependencies = []
+
+[project.optional-dependencies]
+pdf = ["pdfplumber>=0.11"]
+dev = ["pytest>=8", "ruff>=0.4", "build", "twine"]
+
+[project.scripts]
+paper-verify = "paper_verifier.verify:main"
+
+[project.urls]
+Repository = "https://github.com/taehyeonglim/paper-verifier"
+Issues = "https://github.com/taehyeonglim/paper-verifier/issues"
+
+[tool.hatch.version]
+path = "src/paper_verifier/__init__.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/paper_verifier"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
