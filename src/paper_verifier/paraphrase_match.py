@@ -7,6 +7,8 @@ quote extraction, thresholds, purpose routing, fail-safes — is deterministic.
 """
 from __future__ import annotations
 
+import json
+import math
 import re
 import shutil
 import subprocess
@@ -288,11 +290,38 @@ def classify_citation_purpose_augmented(
     return llm_purpose, "llm"
 
 
+def _first_json_object(text: str) -> dict:
+    """Decode the first balanced object, tolerating fences and surrounding prose."""
+    start = text.find("{")
+    if start < 0:
+        raise ValueError("no JSON object in response")
+    depth = 0
+    in_string = escaped = False
+    for end in range(start, len(text)):
+        ch = text[end]
+        if in_string:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_string = False
+        elif ch == '"':
+            in_string = True
+        elif ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return json.loads(text[start:end + 1])
+    raise ValueError("incomplete JSON object in response")
+
+
 def dispatch_paraphrase_check(paraphrase: str, original_quote: str) -> tuple[float, str]:
     """LLM call — semantic-equivalence score for paraphrase vs original quote.
 
     Returns (score 0~1, raw_response); (-1.0, reason) when the provider is
-    unavailable or the call/parse fails (callers route -1.0 to MANUAL).
+    unavailable or the call/parse fails (callers route -1.0 to FAIL with no score).
     """
     if not _llm_available():
         return -1.0, f"{_provider_name()} CLI not available — semantic check skipped"
@@ -314,16 +343,14 @@ def dispatch_paraphrase_check(paraphrase: str, original_quote: str) -> tuple[flo
         rc = getattr(result, "returncode", 0)
         if rc != 0:
             return -1.0, f"{_provider_name()} rc={rc}: {out[:300]}"
-        # Score parsing accepts leading-dot (.91) and integers, rejects malformed.
-        m = re.search(r'"score"\s*:\s*(\d*\.?\d+)', out)
-        if not m:
-            return -1.0, out[:500]
-        score = float(m.group(1))
-        # Out-of-range scores (e.g. {"score": 10}) are LLM misbehavior: demote
-        # to MANUAL rather than letting them clear the threshold (false PASS).
-        if not (0.0 <= score <= 1.0):
+        score = _first_json_object(out).get("score")
+        # JSON booleans/strings are not numeric scores. Preserve exponent syntax
+        # (1e-3 is 0.001) and reject non-finite/out-of-range values.
+        if type(score) not in (int, float):
+            return -1.0, f"score is not a JSON number: {score!r} — {out[:300]}"
+        if not (0.0 <= score <= 1.0) or not math.isfinite(score):
             return -1.0, f"score out of range [0,1]: {score} — {out[:300]}"
-        return score, out[:500]
+        return float(score), out[:500]
     except (OSError, subprocess.SubprocessError, ValueError, RuntimeError) as e:
         return -1.0, f"{_provider_name()} call failed: {e}"
 
@@ -394,11 +421,15 @@ def match_paraphrases(
 
         keywords = extract_keywords(c.context_paraphrase)
         quote = extract_quote_from_pdf(pdf_path, keywords=keywords)
-        score, _reason = dispatch_paraphrase_check(
-            c.context_paraphrase, quote[:2000],
-        )
-        if score is None or score < 0:
-            status = "MANUAL"
+        score = None
+        if quote.strip():
+            score, _reason = dispatch_paraphrase_check(
+                c.context_paraphrase, quote[:2000],
+            )
+        if (type(score) not in (int, float) or not 0.0 <= score <= 1.0
+                or not math.isfinite(score)):
+            score = None
+            status = "FAIL"
         elif score >= threshold:
             status = "PASS"
         else:

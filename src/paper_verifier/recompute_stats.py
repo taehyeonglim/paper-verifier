@@ -6,6 +6,7 @@ ground truth and diffs each manuscript claim against it 1:1.
 """
 from __future__ import annotations
 
+import math
 import re
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
@@ -42,6 +43,7 @@ class GroundTruthRow:
     M_LQ: Optional[float] = None
     SD_LQ: Optional[float] = None
     alpha: Optional[float] = None
+    validation_errors: list[str] = field(default_factory=list)
 
 
 # Reliability (Cronbach α / KR-20) ground truth keyed by DV — [stats.alpha].
@@ -106,7 +108,8 @@ def _to_float(s: str) -> Optional[float]:
     if s.startswith("."):
         s = "0" + s
     try:
-        return float(s)
+        value = float(s)
+        return value if math.isfinite(value) else None
     except ValueError:
         return None
 
@@ -137,11 +140,18 @@ CONDITION_LABELS: tuple[str, ...] = ()
 PERCENT_DVS: set[str] = set()
 
 
+def _validate_required_fields(rec: GroundTruthRow, table: str, fields: tuple[str, ...]) -> None:
+    missing = [name for name in fields if getattr(rec, name) is None]
+    if missing:
+        rec.validation_errors.append(f"{table}: missing/invalid required fields: {', '.join(missing)}")
+
+
 def load_ground_truth(verification_md: Path) -> dict[str, GroundTruthRow]:
     """Parse the statistics verification markdown into a per-DV ground-truth dict.
 
     Table locations come from TABLE_HEADINGS; row labels resolve to canonical
-    DV keys via DV_ALIASES. Rows with unmapped labels are skipped.
+    DV keys via DV_ALIASES. Rows with unmapped labels are skipped. Invalid
+    mapped rows are retained with validation_errors and cannot verify claims.
     """
     text = verification_md.read_text(encoding="utf-8")
     truth: dict[str, GroundTruthRow] = {}
@@ -149,29 +159,30 @@ def load_ground_truth(verification_md: Path) -> dict[str, GroundTruthRow]:
     # Table 1: p-values (R vs scipy cross-check)
     p_rows = _parse_md_table_section(text, TABLE_HEADINGS["p_table"])
     for row in p_rows:
-        if len(row) < 7:
-            continue
         std_name = DV_ALIASES.get(row[0])
         if not std_name:
             continue
-        truth[std_name] = GroundTruthRow(
-            dv=std_name,
-            F=_to_float(row[1]),
-            df1=int(row[2]) if row[2].isdigit() else None,
-            df2=int(row[3]) if row[3].isdigit() else None,
-            p_R=_to_float(row[4]),
-            p_scipy=_to_float(row[5]),
-            parity="✓" if "✓" in row[6] else "✗",
+        row = row + [""] * max(0, 7 - len(row))
+        rec = truth.setdefault(std_name, GroundTruthRow(dv=std_name))
+        rec.F = _to_float(row[1])
+        rec.df1 = int(row[2]) if row[2].isdigit() else None
+        rec.df2 = int(row[3]) if row[3].isdigit() else None
+        rec.p_R = _to_float(row[4])
+        rec.p_scipy = _to_float(row[5])
+        rec.parity = "✗" if "✗" in row[6] else "✓" if "✓" in row[6] else "unknown"
+        if rec.parity != "✓":
+            rec.validation_errors.append(f"p table: R/scipy parity {rec.parity} — not confirmed")
+        _validate_required_fields(
+            rec, "p table", ("F", "df1", "df2", "p_R", "p_scipy"),
         )
 
     # Table 2: β, SE, 95% CI
     beta_rows = _parse_md_table_section(text, TABLE_HEADINGS["beta_table"])
     for row in beta_rows:
-        if len(row) < 4:
-            continue
         std_name = DV_ALIASES.get(row[0])
         if not std_name:
             continue
+        row = row + [""] * max(0, 4 - len(row))
         rec = truth.setdefault(std_name, GroundTruthRow(dv=std_name))
         rec.beta = _to_float(row[1])
         rec.SE = _to_float(row[2])
@@ -180,21 +191,29 @@ def load_ground_truth(verification_md: Path) -> dict[str, GroundTruthRow]:
         if ci_match:
             rec.CI_low = _to_float(ci_match.group(1))
             rec.CI_high = _to_float(ci_match.group(2))
+        else:
+            rec.CI_low = rec.CI_high = None
+        _validate_required_fields(rec, "beta table", ("beta", "SE", "CI_low", "CI_high"))
+        if len(row) > 4 and "✗" in row[4]:
+            rec.validation_errors.append("beta table: CI consistency ✗")
 
     # Table 3: Wilcoxon + effect sizes
     wil_rows = _parse_md_table_section(text, TABLE_HEADINGS["wilcoxon_table"])
     for row in wil_rows:
-        if len(row) < 8:
-            continue
         std_name = DV_ALIASES.get(row[0])
         if not std_name:
             continue
+        short_row = len(row) < 8
+        row = row + [""] * max(0, 8 - len(row))
         rec = truth.setdefault(std_name, GroundTruthRow(dv=std_name))
         rec.V = _to_float(row[1])
         rec.p_wil = _to_float(row[2])
         rec.r = _to_float(row[3])
         # dz sits in column index 5
-        rec.dz = _to_float(row[5]) if len(row) > 5 else None
+        rec.dz = _to_float(row[5])
+        _validate_required_fields(rec, "Wilcoxon table", ("V", "p_wil", "r", "dz"))
+        if short_row or _to_float(row[7]) is None:
+            rec.validation_errors.append("Wilcoxon table: missing/invalid required columns (including n)")
 
     # Seed reliability ground truth (independent of the tables above)
     for dv, alpha in ALPHA_GROUND_TRUTH.items():
@@ -318,13 +337,29 @@ def _digit_rounded_equal(observed, expected, raw_text: str):
         digits = len(m.group(1))
     if observed is None or expected is None:
         return False, expected, digits
-    tol = 10 ** (-digits) * 0.5 + 1e-9 if digits > 0 else 1e-9
+    tol = 10 ** (-digits) * 0.5 + 1e-9
     ok = abs(observed - expected) <= tol
     return ok, expected, digits
 
 
 def _round_to(a: float, digits: int) -> float:
     return round(a, digits)
+
+
+def _claim_span(claim: dict, snippet: str) -> Optional[tuple[int, int]]:
+    """Use extraction offsets; legacy claims may fall back only to a unique match."""
+    raw = claim.get("raw_text", "")
+    start, end = claim.get("start"), claim.get("end")
+    if start is not None or end is not None:
+        if (type(start) is int and type(end) is int
+                and 0 <= start < end <= len(snippet) and snippet[start:end] == raw):
+            return start, end
+        return None
+    if raw:
+        matches = list(re.finditer(re.escape(raw), snippet))
+        if len(matches) == 1:
+            return matches[0].span()
+    return None
 
 
 def verify_claim(claim: dict, truth_by_dv: dict[str, GroundTruthRow], idx: int) -> VerificationResult:
@@ -339,8 +374,8 @@ def verify_claim(claim: dict, truth_by_dv: dict[str, GroundTruthRow], idx: int) 
             verifier="python-recompute", status="WARN",
             evidence="Malformed claim: missing claim_type/parsed_value — not verified",
         )
-    snippet = claim.get("context_snippet", "") + " " + claim.get("raw_text", "")
-    dv = _infer_dv(snippet)
+    snippet = claim.get("context_snippet", "") or claim.get("raw_text", "")
+    dv = _infer_dv(snippet + " " + claim.get("raw_text", ""))
     result_id = f"vr-{idx:04d}"
 
     # Guard 1: p_value with op != "=" or near a modifier keyword — not a main-effect comparison
@@ -376,6 +411,24 @@ def verify_claim(claim: dict, truth_by_dv: dict[str, GroundTruthRow], idx: int) 
 
     # alpha/N never touch gt below — .get() keeps a missing dv None-safe (no KeyError).
     gt = truth_by_dv.get(dv)
+    if ctype not in ("alpha", "N") and (gt.validation_errors or gt.parity == "✗"):
+        reasons = gt.validation_errors or ["R/scipy parity ✗"]
+        return VerificationResult(
+            id=result_id, target_type="numerical-claim", target_id=claim["id"],
+            verifier="python-recompute", status="WARN",
+            evidence=f"Ground truth invalid for {dv} — not verified: {'; '.join(reasons)}",
+            matched_dv=dv,
+        )
+    span = None
+    if ctype in ("p_value", "CI_pair", "M_mean", "SD", "percent"):
+        span = _claim_span(claim, snippet)
+        if span is None:
+            return VerificationResult(
+                id=result_id, target_type="numerical-claim", target_id=claim["id"],
+                verifier="python-recompute", status="MANUAL",
+                evidence="Claim position unavailable/ambiguous — extraction offsets required",
+                matched_dv=dv,
+            )
     # Extract expected per claim type
     expected: Optional[float] = None
     observed: Optional[float] = None
@@ -406,9 +459,7 @@ def verify_claim(claim: dict, truth_by_dv: dict[str, GroundTruthRow], idx: int) 
         # marker, default to p_R (bare p's are usually F-test main effects). The scope
         # extends through this p's raw_text so a marker inside it (e.g. a whole
         # "Wilcoxon V=…, p=…") still counts.
-        raw_p = claim.get("raw_text", "")
-        _pos = snippet.find(raw_p)
-        _scope = (snippet[:_pos + len(raw_p)] if _pos >= 0 else snippet).lower()
+        _scope = snippet[:span[1]].lower()
         _wil = max(_scope.rfind("wilcoxon"), _scope.rfind("*v*"),
                    _last_match_pos(_scope, r"(?<![a-z])v\s*="))
         _f = max(_scope.rfind("*f*"), _last_match_pos(_scope, r"(?<![a-z])f\s*\("))
@@ -451,8 +502,7 @@ def verify_claim(claim: dict, truth_by_dv: dict[str, GroundTruthRow], idx: int) 
         # Guard 2: position-based — with 2+ CI pairs on a line, the second and later
         # ones are presumed effect-size CIs (the β CI is normally printed first).
         # Decisive on table rows.
-        raw = claim.get("raw_text", "")
-        raw_pos = snippet.find(raw)
+        raw_pos = span[0]
         if raw_pos > 0:
             prior_cis = re.findall(r"\[\s*[+\-−.\d]+\s*,\s*[+\-−.\d]+\s*\]", snippet[:raw_pos])
             if len(prior_cis) >= 1:
@@ -480,15 +530,27 @@ def verify_claim(claim: dict, truth_by_dv: dict[str, GroundTruthRow], idx: int) 
                 matched_dv=dv,
             )
         # Half-ULP at the printed precision, not a fixed 0.01 tolerance (valid-rounding test).
-        raw = claim.get("raw_text", "")
-        ok_low, _, digits = _digit_rounded_equal(observed_low, gt.CI_low, raw)
-        ok_high, _, _ = _digit_rounded_equal(observed_high, gt.CI_high, raw)
+        raw_values = claim.get("raw_values") or {}
+        raw_low, raw_high = raw_values.get("ci_low"), raw_values.get("ci_high")
+        if raw_low is None or raw_high is None:
+            # Backward-compatible path for records predating raw_values.
+            ci_match = re.search(r"\[\s*([+\-−.\d]+)\s*,\s*([+\-−.\d]+)\s*\]", claim.get("raw_text", ""))
+            if ci_match:
+                raw_low, raw_high = ci_match.groups()
+            else:
+                return VerificationResult(
+                    id=result_id, target_type="numerical-claim", target_id=claim["id"],
+                    verifier="python-recompute", status="WARN",
+                    evidence="CI endpoint text/precision unavailable — not verified", matched_dv=dv,
+                )
+        ok_low, _, digits_low = _digit_rounded_equal(observed_low, gt.CI_low, raw_low)
+        ok_high, _, digits_high = _digit_rounded_equal(observed_high, gt.CI_high, raw_high)
         status = "PASS" if (ok_low and ok_high) else "FAIL"
         return VerificationResult(
             id=result_id, target_type="numerical-claim", target_id=claim["id"],
             verifier="python-recompute", status=status,
-            evidence=(f"CI claim=[{observed_low}, {observed_high}] "
-                      f"gt=[{gt.CI_low}, {gt.CI_high}] (digits={digits})"),
+            evidence=(f"CI claim=[{raw_low}, {raw_high}] "
+                      f"gt=[{gt.CI_low}, {gt.CI_high}] (digits={digits_low}/{digits_high})"),
             matched_dv=dv,
         )
     elif ctype == "alpha":
@@ -597,8 +659,7 @@ def verify_claim(claim: dict, truth_by_dv: dict[str, GroundTruthRow], idx: int) 
                 matched_dv=dv,
             )
         label_a, label_b = CONDITION_LABELS  # order matches summary-table columns
-        raw = claim.get("raw_text", "")
-        raw_pos = snippet.find(raw)
+        raw_pos = span[0]
         mod = None
         if raw_pos >= 0:
             before_text = snippet[:raw_pos].lower()

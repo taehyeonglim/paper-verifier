@@ -9,8 +9,9 @@ import sys
 import tempfile
 from pathlib import Path
 
+import pytest
 
-from paper_verifier import recompute_stats
+from paper_verifier import recompute_stats, verify
 
 
 # Section-1 row keeps the Korean label "조작점검" on purpose: it regression-tests
@@ -166,3 +167,48 @@ def test_verify_unknown_claim_type_returns_manual(tmp_path):
     }
     vr = recompute_stats.verify_claim(claim, truth, idx=6)
     assert vr.status == "MANUAL"
+
+
+@pytest.mark.parametrize("row", [
+    "| Manipulation Check | 7.634 | 1 | 36 | .008965 | .008966 | ✗ |",
+    "| Manipulation Check | 7.634 | 1 | 36 | .008965 | .008966 | |",
+    "| Manipulation Check | 7.634 | 1 | 36 | .008965 | — | ✓ |",
+    "| Manipulation Check | 7.634 | 1 | | .008965 | .008966 | ✓ |",
+    "| Manipulation Check | 7.634 | 1 | 36 | .008965 |",
+    "| Manipulation Check | 7.634 | 1 | 36 | .008965 | NaN | ✓ |",
+])
+def test_unvalidated_ground_truth_row_never_passes(tmp_path, row):
+    md = tmp_path / "stats.md"
+    md.write_text(
+        "## 1. p-value verification\n\n"
+        "| DV | F | df1 | df2 | R p | scipy p | match |\n"
+        "|----|---|-----|-----|-----|---------|------|\n" + row + "\n", encoding="utf-8",
+    )
+    truth = recompute_stats.load_ground_truth(md)
+    assert truth["manipulation_check"].validation_errors
+    assert verify.has_table_ground_truth(truth) is False
+    result = recompute_stats.verify_claim({
+        "id": "claim-1", "claim_type": "F_stat",
+        "parsed_value": {"df1": 1, "df2": 36, "F": 7.63},
+        "raw_text": "F(1, 36) = 7.63", "context_snippet": "manipulation check F(1, 36) = 7.63",
+    }, truth, 1)
+    assert result.status == "WARN"
+    assert "Ground truth invalid" in result.evidence
+    assert "not verified" in result.evidence
+
+
+@pytest.mark.parametrize(("original", "replacement", "table"), [
+    ("| +0.574 | 0.208 |", "| +0.574 | — |", "beta table"),
+    ("[0.167, 0.982] | ✓", "[0.167, 0.982] | ✗", "beta table"),
+    ("455.0 | .007223", "455.0 | —", "Wilcoxon table"),
+])
+def test_invalid_supplementary_table_row_cannot_supply_a_pass(tmp_path, original, replacement, table):
+    md = tmp_path / "stats.md"
+    md.write_text(FIXTURE_VERIFICATION_MD.replace(original, replacement), encoding="utf-8")
+    truth = recompute_stats.load_ground_truth(md)
+    result = recompute_stats.verify_claim({
+        "id": "claim-1", "claim_type": "F_stat", "parsed_value": {"F": 7.63},
+        "raw_text": "F = 7.63", "context_snippet": "manipulation check F = 7.63",
+    }, truth, 1)
+    assert result.status == "WARN"
+    assert table in result.evidence

@@ -16,7 +16,8 @@ To pin one, declare a custom argv, e.g. for Codex::
             "-c", "model=\\"gpt-5.6-terra\\"", "-"]
 
 When no provider is available (``provider = "none"`` or the binary is not on
-PATH), semantic checks degrade to MANUAL instead of failing the run.
+PATH), semantic checks have no score; a requested Phase 2 without completed
+semantic checks fails the CLI coverage gate.
 """
 from __future__ import annotations
 

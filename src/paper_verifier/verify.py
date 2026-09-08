@@ -11,7 +11,7 @@ Usage:
 Phase 1 is fully deterministic: numerical-claim extraction, ground-truth
 cross-check, reference/citation graph audit, local PDF attachment.
 Phase 2 additionally delegates paraphrase semantic matching to a local LLM
-CLI (optional; results degrade to MANUAL when no LLM is available).
+CLI (optional; a requested check fails when no LLM score is available).
 
 Exit code: 1 if any verification target FAILed, else 0.
 """
@@ -20,6 +20,7 @@ from __future__ import annotations
 import argparse
 import glob as _glob
 import json
+import math
 import sys
 from collections import Counter
 from dataclasses import asdict
@@ -51,6 +52,7 @@ def has_table_ground_truth(primary_truth: dict) -> bool:
     return any(
         any(getattr(row, f, None) is not None for f in _TABLE_GT_FIELDS)
         for row in primary_truth.values()
+        if not getattr(row, "validation_errors", ()) and getattr(row, "parity", None) != "✗"
     )
 
 
@@ -99,6 +101,8 @@ def main(argv: list[str] | None = None) -> int:
                         help="Exact reports directory (default: <root>/.paper-verifier/<sha8>).")
     args = parser.parse_args(argv)
 
+    if args.config is not None and not args.config.is_file():
+        parser.error(f"config file not found or not a file: {args.config}")
     cfg = config.load(args.config) if args.config else config.VerifierConfig()
     config.apply(cfg)
 
@@ -110,7 +114,10 @@ def main(argv: list[str] | None = None) -> int:
     manuscript_paths: list[Path] = []
     seen: set[Path] = set()
     for spec in specs:
-        for p in _expand_spec(str(spec), spec_base):
+        expanded = _expand_spec(str(spec), spec_base)
+        if not expanded:
+            parser.error(f"manuscript pattern matched no files: {spec}")
+        for p in expanded:
             rp = p.resolve()
             if rp not in seen:
                 seen.add(rp)
@@ -118,7 +125,7 @@ def main(argv: list[str] | None = None) -> int:
     if not manuscript_paths:
         parser.error("no manuscript files specified "
                      "(use --manuscript or [project].manuscripts in --config)")
-    missing = [p for p in manuscript_paths if not p.exists()]
+    missing = [p for p in manuscript_paths if not p.is_file()]
     if missing:
         parser.error("manuscript file(s) not found: "
                      + ", ".join(str(p) for p in missing))
@@ -127,13 +134,15 @@ def main(argv: list[str] | None = None) -> int:
     if refs_path is None:
         print("WARN: no references file configured — reference/citation audit SKIPPED",
               file=sys.stderr)
-    elif not refs_path.exists():
-        print(f"WARN: references file not found ({refs_path}) — "
-              "reference/citation audit SKIPPED", file=sys.stderr)
-        refs_path = None
 
     stats_path = args.stats or cfg.stats
     summary_stats_path = args.summary_stats or cfg.summary_stats
+    for label, path in (("references", refs_path), ("stats", stats_path),
+                        ("summary-stats", summary_stats_path)):
+        if path is not None and not path.is_file():
+            parser.error(f"{label} file not found or not a file: {path}")
+    if cfg.library_root is not None and not cfg.library_root.is_dir():
+        parser.error(f"library root not found or not a directory: {cfg.library_root}")
 
     # ── 1. Ingest ────────────────────────────────────────────────────────
     manuscripts = ingest.ingest_files(manuscript_paths)
@@ -197,6 +206,10 @@ def main(argv: list[str] | None = None) -> int:
                   file=sys.stderr)
             primary_truth = {}
     has_table_gt = has_table_ground_truth(primary_truth)
+    for dv, row in primary_truth.items():
+        if row.validation_errors:
+            print(f"WARN: invalid statistical ground truth for {dv}: "
+                  + "; ".join(row.validation_errors), file=sys.stderr)
     if stats_path is not None and not has_table_gt:
         print(f"WARN: primary statistical ground truth empty/stale from {stats_path}",
               file=sys.stderr)
@@ -205,6 +218,16 @@ def main(argv: list[str] | None = None) -> int:
         truth = recompute_stats.merge_analysis_summary(truth, summary_stats_path)
 
     verifications = []
+
+    def coverage_failure(stage: str, reason: str) -> None:
+        print(f"FAIL: {reason}", file=sys.stderr)
+        verifications.append(recompute_stats.VerificationResult(
+            id=f"vr-{len(verifications) + 1:04d}", target_type="coverage",
+            target_id=stage, verifier="coverage-gate", status="FAIL", evidence=reason,
+        ))
+
+    if (stats_path is not None or summary_stats_path is not None) and not all_claims:
+        coverage_failure("statistics", "Statistical verification requested but 0 numerical claims extracted")
     # Ground-truth gate: statistical claims exist but no table-derived ground
     # truth is available → hard FAIL. Without this gate every F/p/β/dz/CI claim
     # would silently drain to MANUAL (fail-open) while the run still exits 0.
@@ -230,6 +253,8 @@ def main(argv: list[str] | None = None) -> int:
     pdfs: list = []
     if refs_path is not None:
         refs = doi_audit.parse_references(refs_path)
+        if not refs:
+            coverage_failure("references", f"Reference audit requested but 0 references parsed from {refs_path}")
         cite_idx = 1
         for m in manuscripts:
             if m.section == "refs":  # the reference list itself is not prose
@@ -289,7 +314,10 @@ def main(argv: list[str] | None = None) -> int:
             ))
             next_vr += 1
         for pdf in pdfs:
-            if pdf.pdf_path and pdf.source_kind == "library-collected-yearfuzzy":
+            if pdf.source_kind == "ambiguous":
+                status = "WARN"
+                evidence = "Ambiguous PDF/fulltext candidates — attachment withheld; resolve DOI/title identity"
+            elif pdf.pdf_path and pdf.source_kind == "library-collected-yearfuzzy":
                 # ±1-year fuzzy match may be a different paper — WARN, not PASS.
                 status = "WARN"
                 evidence = (f"PDF attached via ±1yr fuzzy match (verify it's the right paper): "
@@ -314,25 +342,57 @@ def main(argv: list[str] | None = None) -> int:
                         recompute_stats.to_records(verifications))
 
     # ── Phase 2: LLM paraphrase semantic matching (opt-in) ───────────────
+    para_matches = []
     if args.phase >= 2 and refs and citations:
-        para_matches = paraphrase_match.match_paraphrases(citations, pdfs, refs)
+        try:
+            para_matches = paraphrase_match.match_paraphrases(citations, pdfs, refs)
+        except (OSError, ValueError, RuntimeError) as e:
+            reason = f"Phase 2 failed: {e}"
+            print(f"FAIL: {reason}", file=sys.stderr)
+            verifications.append(recompute_stats.VerificationResult(
+                id=f"vr-{len(verifications) + 1:04d}",
+                target_type="phase-2", target_id="paraphrase-matching",
+                verifier="phase-2-gate", status="FAIL", evidence=reason,
+            ))
+            para_matches = []
         if para_matches:
             jsonl_io.write_all(reports_dir / "paraphrase_matches.jsonl",
                                 paraphrase_match.to_records(para_matches))
             print(f"\nparaphrase matches: {len(para_matches)}")
             para_status_counts = Counter(m.status for m in para_matches)
             for st, n in para_status_counts.most_common():
-                print(f"  {st:8s} {n:>4d}")
+                print(f"  {str(st):8s} {n:>4d}")
             # Fold paraphrase results into verifications so a paraphrase FAIL
             # is reflected in the exit code and the summary, with each match's
             # own status (not an ad-hoc score bucket).
             for pm in para_matches:
+                status = pm.status if pm.status in ("PASS", "FAIL", "WARN", "MANUAL") else "FAIL"
+                evidence = f"paraphrase score={pm.score} ref={pm.ref_id}"
+                if status != pm.status:
+                    evidence += f"; incomplete/unknown Phase 2 status: {pm.status!r}"
+                if status == "PASS" and not (
+                    type(pm.score) in (int, float) and 0.0 <= pm.score <= 1.0
+                    and math.isfinite(pm.score)
+                ):
+                    status = "FAIL"
+                    evidence += "; invalid/missing semantic score"
                 verifications.append(recompute_stats.VerificationResult(
                     id=f"vr-{len(verifications) + 1:04d}",
                     target_type="paraphrase-match", target_id=pm.citation_id,
-                    verifier=pm.verifier, status=pm.status,
-                    evidence=f"paraphrase score={pm.score} ref={pm.ref_id}",
+                    verifier=pm.verifier, status=status, evidence=evidence,
                 ))
+
+    if args.phase >= 2 and not any(
+        pm.status in ("PASS", "FAIL")
+        and type(pm.score) in (int, float)
+        and 0.0 <= pm.score <= 1.0 and math.isfinite(pm.score)
+        for pm in para_matches
+    ):
+        coverage_failure(
+            "phase-2", "Phase 2 requested but 0 semantic checks completed "
+            f"(references={len(refs)}, citations={len(citations)}, matches={len(para_matches)}); "
+            "check source attachments, eligible citations and LLM availability/results",
+        )
 
     # Rewrite with the Phase-2 additions included (final state).
     jsonl_io.write_all(reports_dir / "verifications.jsonl",
@@ -364,6 +424,7 @@ def main(argv: list[str] | None = None) -> int:
                          stats_label=str(stats_path) if stats_path else None)
         print(f"summary.md: {_display(reports_dir / 'summary.md')}")
 
+    fail_count = status_counts.get("FAIL", 0)
     if args.check_summary_length:
         from paper_verifier._lib.summary_page_check import check_summary_page_count
         summary_md = reports_dir / "summary.md"
@@ -372,8 +433,9 @@ def main(argv: list[str] | None = None) -> int:
         print(f"  lines:  {page_check.line_count}")
         print(f"  status: {page_check.status}")
         print(f"  msg:    {page_check.message}")
+        if page_check.status == "FAIL":
+            fail_count += 1
 
-    fail_count = status_counts.get("FAIL", 0)
     return 0 if fail_count == 0 else 1
 
 

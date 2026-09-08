@@ -14,7 +14,7 @@ import sys
 from pathlib import Path
 
 
-from paper_verifier import recompute_stats
+from paper_verifier import claim_parser, recompute_stats
 
 # manipulation_check: p_R=.008965 (F test), p_wil=.007223 (Wilcoxon)
 FIXTURE_P = """---
@@ -174,3 +174,52 @@ def test_wilcoxon_p_would_fail_against_p_R(tmp_path):
     }
     vr = recompute_stats.verify_claim(claim, truth, idx=6)
     assert vr.status == "FAIL"
+
+
+def test_identical_p_values_route_to_their_own_offsets(tmp_path):
+    truth = _truth(tmp_path)
+    line = "  manipulation check F(1, 36) = 7.63, p = .009; Wilcoxon V = 455, p = .009  "
+    claims = [c for c in claim_parser.to_records(claim_parser.extract_from_text(line, "m1", "results"))
+              if c["claim_type"] == "p_value"]
+    assert len(claims) == 2
+    assert claims[0]["start"] == line.index("p = .009")
+    assert claims[1]["start"] == line.rindex("p = .009")
+    for claim in claims:
+        assert line[claim["start"]:claim["end"]] == claim["raw_text"]
+        assert claim["context_snippet"] == line
+    first, second = [recompute_stats.verify_claim(c, truth, i) for i, c in enumerate(claims, 1)]
+    assert first.status == "PASS"
+    assert first.expected_value == truth["manipulation_check"].p_R
+    assert second.status == "FAIL"
+    assert second.expected_value == truth["manipulation_check"].p_wil
+
+
+def test_identical_means_route_to_separate_conditions():
+    line = "ET face dwell under HQ *M* = 8.52; under LQ *M* = 8.52"
+    claims = claim_parser.to_records(claim_parser.extract_from_text(line, "m1", "results"))
+    truth = {"ET_face_dwell": recompute_stats.GroundTruthRow(dv="ET_face_dwell", M_HQ=8.52, M_LQ=4.60)}
+    first, second = [recompute_stats.verify_claim(c, truth, i) for i, c in enumerate(claims, 1)]
+    assert first.status == "PASS" and first.matched_dv == "ET_face_dwell_HQ"
+    assert second.status == "FAIL" and second.matched_dv == "ET_face_dwell_LQ"
+    assert second.expected_value == 4.60
+
+
+def test_identical_ci_pairs_keep_second_position():
+    line = "manipulation check CI [0.17, 0.98]; another interval [0.17, 0.98]"
+    claims = claim_parser.to_records(claim_parser.extract_from_text(line, "m1", "results"))
+    truth = {"manipulation_check": recompute_stats.GroundTruthRow(dv="manipulation_check", CI_low=0.167, CI_high=0.982)}
+    first, second = [recompute_stats.verify_claim(c, truth, i) for i, c in enumerate(claims, 1)]
+    assert first.status == "PASS"
+    assert second.status == "MANUAL"
+    assert "position 2" in second.evidence
+
+
+def test_legacy_duplicate_without_offsets_is_not_guessed(tmp_path):
+    claim = {
+        "id": "legacy", "claim_type": "p_value", "parsed_value": {"p": 0.009},
+        "raw_text": "p = .009",
+        "context_snippet": "manipulation check F(1, 36) = 7.63, p = .009; Wilcoxon p = .009",
+    }
+    result = recompute_stats.verify_claim(claim, _truth(tmp_path), 1)
+    assert result.status == "MANUAL"
+    assert "offsets required" in result.evidence
