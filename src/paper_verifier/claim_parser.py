@@ -127,6 +127,11 @@ class NumericalClaim:
     claim_type: str
     parsed_value: dict = field(default_factory=dict)
     context_snippet: str = ""
+    # Zero-based, half-open character offsets in the original line/context_snippet.
+    # Optional for compatibility with older callers and serialized claims.
+    start: int | None = None
+    end: int | None = None
+    raw_values: dict[str, str] = field(default_factory=dict)
 
 
 def _normalize_minus(num_str: str) -> float:
@@ -179,7 +184,10 @@ def extract_from_text(
                         raw_text=m.group(0),
                         claim_type=claim_type,
                         parsed_value=parsed,
-                        context_snippet=line.strip(),
+                        context_snippet=line,
+                        start=m.start(),
+                        end=m.end(),
+                        raw_values={key: val for key, val in zip(value_keys, groups) if val is not None},
                     )
                 )
                 next_idx += 1

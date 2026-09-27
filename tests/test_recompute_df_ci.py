@@ -10,8 +10,9 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
+import pytest
 
-from paper_verifier import recompute_stats
+from paper_verifier import claim_parser, recompute_stats
 
 # manipulation_check: F=7.634 df(1,36), CI=[0.167, 0.982]
 FIXTURE = """---
@@ -120,3 +121,23 @@ def test_digit_rounded_equal_helper():
     ok_up, _, _ = recompute_stats._digit_rounded_equal(0.44, 0.435, "[0.44, x]")
     ok_down, _, _ = recompute_stats._digit_rounded_equal(0.43, 0.435, "[0.43, x]")
     assert ok_up is True and ok_down is True
+
+
+@pytest.mark.parametrize(("bounds", "status", "digits"), [
+    ("[0.2, 0.94]", "FAIL", "1/2"),
+    ("[0.2, 0.98]", "PASS", "1/2"),
+    ("[0.16, 1.0]", "FAIL", "2/1"),
+    ("[0.2, 0.980]", "FAIL", "1/3"),
+    ("[0, 0.98]", "PASS", "0/2"),
+])
+@pytest.mark.parametrize("legacy", [False, True])
+def test_CI_endpoints_use_independent_printed_precision(tmp_path, bounds, status, digits, legacy):
+    claims = claim_parser.extract_from_text(f"manipulation check 95% CI {bounds}", "m1", "results")
+    claim = claim_parser.to_records(claims)[0]
+    low, high = bounds[1:-1].split(", ")
+    assert claim["raw_values"] == {"ci_low": low, "ci_high": high}
+    if legacy:
+        del claim["raw_values"]
+    result = recompute_stats.verify_claim(claim, _truth(tmp_path), 1)
+    assert result.status == status
+    assert f"digits={digits}" in result.evidence

@@ -4,6 +4,7 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
+import pytest
 
 from paper_verifier import recompute_stats, paraphrase_match
 from paper_verifier._lib import jsonl_io
@@ -57,7 +58,7 @@ def test_paraphrase_score_valid(monkeypatch):
 
 
 def test_paraphrase_score_out_of_range_rejected(monkeypatch):
-    """A score of 10 is out of range -> -1.0 (MANUAL); prevents a false PASS."""
+    """A score of 10 is out of range -> -1.0 sentinel; prevents a false PASS."""
     _mock_codex(monkeypatch, '{"score": 10, "reason": "hallucinated"}')
     score, reason = paraphrase_match.dispatch_paraphrase_check("a", "b")
     assert score == -1.0
@@ -72,8 +73,59 @@ def test_paraphrase_score_nonzero_returncode_rejected(monkeypatch):
     assert "rc=1" in reason
 
 
-def test_paraphrase_score_leading_dot_parsed(monkeypatch):
-    """Leading-dot floats (.91) parse correctly."""
+def test_paraphrase_score_leading_dot_rejected(monkeypatch):
+    """Leading-dot floats (.91) are invalid JSON and must not become scores."""
     _mock_codex(monkeypatch, '{"score": .91}')
     score, _ = paraphrase_match.dispatch_paraphrase_check("a", "b")
-    assert abs(score - 0.91) < 1e-9
+    assert score == -1.0
+
+
+@pytest.mark.parametrize(("response", "expected"), [
+    ('{"score": 1e-3}', 0.001),
+    ('{"score": 0.85}', 0.85),
+    ('Answer:\n```json\n{"score": 0.85}\n```\nDone.', 0.85),
+    ('{"score": 0.85, "reason": "braces } {", "details": {"ok": true}} after {"score": 1}', 0.85),
+    ('{"score": 0}', 0.0),
+    ('{"score": 1}', 1.0),
+])
+def test_paraphrase_score_json_numbers(monkeypatch, response, expected):
+    _mock_codex(monkeypatch, response)
+    score, _ = paraphrase_match.dispatch_paraphrase_check("a", "b")
+    assert score == expected
+
+
+@pytest.mark.parametrize("response", [
+    '{"score": "high"}', '{"score": "0.85"}', '{"score": 1.5}',
+    'score: 0.85', '{"score": NaN}', '{"score": Infinity}',
+    '{"score": true}', '{"score": null}', '{}', '{"score": -0.5}',
+    '{"score": 0.85', '{"score": 0.85oops}',
+])
+def test_invalid_paraphrase_json_rejected(monkeypatch, response):
+    _mock_codex(monkeypatch, response)
+    score, _ = paraphrase_match.dispatch_paraphrase_check("a", "b")
+    assert score == -1.0
+
+
+@pytest.mark.parametrize("response", ['{"score": "high"}', '{"score": 1.5}', 'not JSON', None])
+def test_score_parse_failure_produces_failed_match(monkeypatch, tmp_path, response):
+    from paper_verifier.doi_audit import InTextCitation
+    from paper_verifier.pdf_attach import SourcePDF
+
+    _mock_codex(monkeypatch, response)
+    source = tmp_path / "source.md"
+    source.write_text("The source reports a specific finding." if response is not None else "", encoding="utf-8")
+    if response is None:
+        def unexpected_call(*args, **kwargs):
+            pytest.fail("An empty source must not be sent to the LLM")
+        monkeypatch.setattr(paraphrase_match.subprocess, "run", unexpected_call)
+    citation = InTextCitation(
+        id="cite-1", manuscript_id="m-1", section="results", line=1,
+        raw_text="(Kim, 2024)", citation_type="parenthetical", first_author_last="Kim",
+        year=2024, ref_id="Kim2024", context_paraphrase="A specific finding.",
+        citation_purpose="finding-cite",
+    )
+    pdf = SourcePDF(id="pdf-1", ref_id="Kim2024", pdf_path=str(source))
+    matches = paraphrase_match.match_paraphrases([citation], [pdf], [], augment_with_llm=False)
+    assert len(matches) == 1
+    assert matches[0].status == "FAIL"
+    assert matches[0].score is None

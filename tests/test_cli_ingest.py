@@ -93,6 +93,39 @@ def test_no_manuscript_is_a_usage_error():
     assert e.value.code == 2  # argparse usage error
 
 
+@pytest.mark.parametrize("flag", ["--raw", "--ground-truth"])
+def test_nerv_only_input_flags_are_explicitly_rejected(flag, capsys):
+    """Upstream has no raw-CSV adapter; unsupported inputs must not be ignored."""
+    with pytest.raises(SystemExit) as exc:
+        verify.main([flag, "unused.csv"])
+    assert exc.value.code == 2
+    assert f"unrecognized arguments: {flag} unused.csv" in capsys.readouterr().err
+
+
+def test_cli_inputs_override_config_in_actual_loaders(tmp_path):
+    """CLI manuscript/stats paths override even missing configured defaults."""
+    cfg = tmp_path / "paper.toml"
+    cfg.write_text(
+        '[project]\nmanuscripts = ["unused.md"]\nstats = "unused-stats.md"\n'
+        + MIN_CFG_TOML, encoding="utf-8",
+    )
+    manuscript = tmp_path / "chosen.md"
+    manuscript.write_text("uncanniness *F*(1, 36) = 7.63", encoding="utf-8")
+    stats = tmp_path / "chosen-stats.md"
+    stats.write_text(STATS_MD, encoding="utf-8")
+    reports = tmp_path / "reports"
+    rc = verify.main(["--config", str(cfg), "--manuscript", str(manuscript),
+                      "--stats", str(stats), "--reports-dir", str(reports)])
+    assert rc == 0
+    manifest = json.loads((reports / "manifest.json").read_text(encoding="utf-8"))
+    assert len(manifest["files"]) == 1
+    assert manifest["files"][0]["file_path"] == str(manuscript)
+    results = list(jsonl_io.read_all(reports / "verifications.jsonl"))
+    assert len(results) == 1
+    assert results[0]["status"] == "PASS"
+    assert results[0]["expected_value"] == 7.634
+
+
 def test_gate_fires_without_ground_truth(tmp_path):
     """Statistical claims + no --stats → ground-truth gate hard FAIL (exit 1)."""
     m = tmp_path / "results.md"
